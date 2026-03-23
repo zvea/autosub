@@ -576,7 +576,11 @@ def validate_audio_tracks(videos: list[Path], requested: int | None) -> None:
     """
     errors: list[str] = []
     for video in videos:
-        tracks = list_audio_tracks(video)
+        try:
+            tracks = list_audio_tracks(video)
+        except av.error.FFmpegError as exc:
+            errors.append(f"{video.name}: cannot read file ({exc.strerror})")
+            continue
         if not tracks:
             errors.append(f"{video.name}: no audio tracks")
         elif requested is None and len(tracks) > 1:
@@ -680,7 +684,10 @@ def main() -> None:
         overall_progress = progress.add_task("Overall:", total=len(videos), total_label=f"{len(videos)} videos")
         for i, video in enumerate(videos, 1):
             progress.console.print(Rule(f"{i}/{len(videos)}: {video.name}"))
-            process_video(progress, video, args=args, model=model)
+            try:
+                process_video(progress, video, args=args, model=model)
+            except av.error.FFmpegError as exc:
+                progress.console.print(f"  [red]Error:[/red] {exc.strerror} — skipping.")
             progress.update(overall_progress, advance=1)
 
 
