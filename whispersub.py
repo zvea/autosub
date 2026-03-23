@@ -113,6 +113,20 @@ _SURROUND_MIX_WEIGHTS: Final = types.MappingProxyType({
     "FR": 0.3,  # front right
 })
 
+
+def _surround_mix_weights(channel_names: list[str]) -> np.ndarray:
+    """Return a normalised per-channel weight vector for surround-to-mono mixing.
+
+    Channels absent from _SURROUND_MIX_WEIGHTS (LFE, surrounds, etc.) get
+    weight 0. If no known channels are present the weights fall back to a flat
+    equal mix so that no audio is silenced.
+    """
+    weights = np.array([_SURROUND_MIX_WEIGHTS.get(ch, 0.0) for ch in channel_names], dtype=np.float32)
+    if weights.sum() == 0:
+        weights = np.ones(len(channel_names), dtype=np.float32)
+    return weights / weights.sum()
+
+
 # Frequently hallucinated strings to filter out
 _KNOWN_HALLUCINATIONS: Final = frozenset({
     "Субтитры создавал DimaTorzok",  # https://github.com/openai/whisper/discussions/2372
@@ -417,18 +431,11 @@ def extract_audio(video: Path, stream_index: int = 0, *, progress: Progress) -> 
             is_surround = "FC" in channel_names
             target_layout = stream.codec_context.layout if is_surround else "mono"
             resampler = av.AudioResampler(format="fltp", layout=target_layout, rate=16000)
-            weights = np.array(
-                [_SURROUND_MIX_WEIGHTS.get(ch, 0.0) for ch in channel_names],
-                dtype=np.float32,
-            )
-            if is_surround:
-                if weights.sum() == 0:
-                    weights = np.ones(len(channel_names), dtype=np.float32)
-                weights /= weights.sum()
+            weights = _surround_mix_weights(channel_names) if is_surround else None
 
             def write_chunk(frame_array: np.ndarray) -> None:
                 """Mix (channels, samples) down to mono and append to tmp."""
-                mono = (frame_array * weights[:, np.newaxis]).sum(axis=0) if is_surround else frame_array[0]
+                mono = (frame_array * weights[:, np.newaxis]).sum(axis=0) if weights is not None else frame_array[0]
                 mono.tofile(tmp)
 
             duration = container.duration / 1_000_000 if container.duration else None

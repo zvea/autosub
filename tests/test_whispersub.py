@@ -3,11 +3,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import av.error
+import numpy as np
 import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import collect_videos, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
+from whispersub import _surround_mix_weights, collect_videos, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -589,3 +590,54 @@ def test_list_audio_tracks_flag_ffmpeg_error(capsys):
         patch("whispersub.list_audio_tracks", side_effect=av.error.InvalidDataError(1, "Invalid data")),
     ):
         main()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _surround_mix_weights
+# ---------------------------------------------------------------------------
+
+
+def test_surround_mix_weights_standard_51():
+    """Standard 5.1 layout: FC gets dominant weight, FL/FR get less, LFE/surrounds are zero."""
+    channels = ["FL", "FR", "FC", "LFE", "BL", "BR"]
+    weights = _surround_mix_weights(channels)
+
+    assert weights.shape == (6,)
+    assert abs(weights.sum() - 1.0) < 1e-6  # normalised
+
+    fc_idx, fl_idx, fr_idx = channels.index("FC"), channels.index("FL"), channels.index("FR")
+    lfe_idx, bl_idx, br_idx = channels.index("LFE"), channels.index("BL"), channels.index("BR")
+
+    assert weights[fc_idx] > weights[fl_idx]   # centre louder than fronts
+    assert weights[fl_idx] == pytest.approx(weights[fr_idx])  # symmetric
+    assert weights[lfe_idx] == 0.0             # LFE excluded
+    assert weights[bl_idx] == 0.0             # surround excluded
+    assert weights[br_idx] == 0.0             # surround excluded
+
+
+def test_surround_mix_weights_centre_only():
+    """A layout with only an FC channel gets all the weight."""
+    weights = _surround_mix_weights(["FC"])
+    assert weights == pytest.approx([1.0])
+
+
+def test_surround_mix_weights_unknown_channels_fallback():
+    """When no known channels are present, falls back to equal mix rather than silence."""
+    channels = ["SL", "SR"]  # side surrounds - not in the weight table
+    weights = _surround_mix_weights(channels)
+
+    assert weights.sum() == pytest.approx(1.0)
+    assert weights[0] == pytest.approx(weights[1])  # equal mix
+
+
+def test_surround_mix_weights_mix_arithmetic():
+    """Weighted mix of a known frame produces the expected mono output."""
+    # 3-channel layout: FL=0.3, FR=0.3, FC=1.0 → raw sum=1.6 → normalised FC≈0.625, FL=FR≈0.1875
+    channels = ["FL", "FR", "FC"]
+    weights = _surround_mix_weights(channels)
+
+    # One sample per channel: FL=0, FR=0, FC=1.0 → mono should equal the FC weight
+    frame = np.array([[0.0], [0.0], [1.0]], dtype=np.float32)  # (channels, samples)
+    mono = (frame * weights[:, np.newaxis]).sum(axis=0)
+
+    assert mono[0] == pytest.approx(weights[channels.index("FC")])
