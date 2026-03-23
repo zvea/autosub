@@ -12,6 +12,7 @@ import enum
 import itertools
 import json
 import math
+import re
 import signal
 import sys
 import tempfile
@@ -554,6 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Transcribe videos to ASS subtitles.", formatter_class=_HelpFormatter, add_help=False)
     parser.add_argument("path", nargs="+", help="Video files or directories to scan recursively")
     parser.add_argument("--audio-track", type=int, metavar="N", help="Audio track index to transcribe (required when a file has multiple tracks)")
+    parser.add_argument("--list-audio-tracks", action="store_true", help="Show audio tracks for all input videos, grouped by configuration, and exit")
     parser.add_argument("--force", action="store_true", help="Overwrite existing subtitle files (default: skip)")
     parser.add_argument("--output-dir", type=Path, metavar="DIR", help="Write subtitle files here instead of alongside each video")
     parser.add_argument("--colour-by", type=ColourBy, default=ColourBy.PROBABILITY, choices=list(ColourBy), help="Per-word background colour coding in console output")
@@ -631,25 +633,42 @@ def process_video(
         progress.console.print(f"  [green]Saved:[/green] {dest}")
 
 
-def main() -> None:
-    args = parse_args()
+def cmd_list_audio_tracks(videos: list[Path]) -> None:
+    """Implement --list-audio-tracks: print unique track configurations with file counts."""
+    configs: dict[tuple[str, ...], list[Path]] = {}
+    read_errors: list[str] = []
+    for video in videos:
+        try:
+            key = tuple(list_audio_tracks(video))
+        except av.error.FFmpegError as exc:
+            read_errors.append(f"{video.name}: {exc.strerror}")
+            continue
+        configs.setdefault(key, []).append(video)
+    for tracks, group in sorted(configs.items(), key=lambda x: -len(x[1])):
+        first = group[0].name
+        others = len(group) - 1
+        first_coloured = f"[cyan]{first}[/cyan]"
+        label = first_coloured if others == 0 else f"{first_coloured} and {others} other {'file' if others == 1 else 'files'}"
+        console.print(f"[bold]{label}:[/bold]")
+        if not tracks:
+            console.print("  [dim]no audio tracks[/dim]")
+        for track in tracks:
+            coloured = re.sub(r"(#\d+)", r"[yellow]\1[/yellow]", track)
+            console.print(f"  {coloured}")
+    if read_errors:
+        error_label = "1 unreadable file" if len(read_errors) == 1 else f"{len(read_errors)} unreadable files"
+        console.print(f"[red]{error_label}[/red]")
+        for error in read_errors:
+            console.print(f"  {error}")
 
-    if args.output_dir and not args.output_dir.is_dir():
-        console.print(f"[red]Error:[/red] --output-dir '{args.output_dir}' does not exist.")
-        sys.exit(1)
 
-    videos = collect_videos(args.path)
-    if not videos:
-        console.print("No video files found.")
-        return
-
-    validate_audio_tracks(videos, args.audio_track)
-
+def load_model(max_threads: int | None) -> WhisperModel:
+    """Load the Whisper model, falling back to CPU if GPU/CUDA is unavailable."""
     console.print(Rule(f"Loading model: {_MODEL}"))
     if sys.platform == "win32":
         _register_nvidia_dll_directories()
     try:
-        model = WhisperModel(_MODEL, compute_type="int8", cpu_threads=args.max_threads or 0)
+        return WhisperModel(_MODEL, compute_type="int8", cpu_threads=max_threads or 0)
     except RuntimeError as exc:
         if "not found or cannot be loaded" not in str(exc):
             raise
@@ -658,8 +677,11 @@ def main() -> None:
             "For GPU support: install CUDA 12 (nvidia.com/cuda-downloads)"
             " or run: [bold]pip install whispersub\\[gpu][/bold]"
         )
-        model = WhisperModel(_MODEL, device="cpu", compute_type="int8", cpu_threads=args.max_threads or 0)
+        return WhisperModel(_MODEL, device="cpu", compute_type="int8", cpu_threads=max_threads or 0)
 
+
+def run_transcription(videos: list[Path], *, args: argparse.Namespace, model: WhisperModel) -> None:
+    """Transcribe all videos, showing a progress bar."""
     progress = Progress(
         TextColumn("  [dim]{task.description}[/dim]"),
         BarColumn(),
@@ -689,6 +711,27 @@ def main() -> None:
             except av.error.FFmpegError as exc:
                 progress.console.print(f"  [red]Error:[/red] {exc.strerror} — skipping.")
             progress.update(overall_progress, advance=1)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.output_dir and not args.output_dir.is_dir():
+        console.print(f"[red]Error:[/red] --output-dir '{args.output_dir}' does not exist.")
+        sys.exit(1)
+
+    videos = collect_videos(args.path)
+    if not videos:
+        console.print("No video files found.")
+        return
+
+    if args.list_audio_tracks:
+        cmd_list_audio_tracks(videos)
+        return
+
+    validate_audio_tracks(videos, args.audio_track)
+    model = load_model(args.max_threads)
+    run_transcription(videos, args=args, model=model)
 
 
 if __name__ == "__main__":

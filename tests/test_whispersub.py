@@ -7,7 +7,7 @@ import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import collect_videos, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
+from whispersub import collect_videos, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -529,3 +529,63 @@ def test_validate_audio_tracks_all_errors_reported_together(capsys):
     with patch("whispersub.list_audio_tracks", side_effect=fake_tracks):
         with pytest.raises(SystemExit):
             validate_audio_tracks([Path("broken.mkv"), Path("silent.mkv")], None)
+
+
+# ---------------------------------------------------------------------------
+# --list-audio-tracks
+# ---------------------------------------------------------------------------
+
+
+def test_list_audio_tracks_flag_aggregates_by_config(capsys):
+    """--list-audio-tracks groups identical configurations with filename-based labels."""
+    single = ["#0 eng aac 48000Hz stereo"]
+    dual = ["#0 eng aac 48000Hz stereo", "#1 jpn ac3 48000Hz stereo"]
+    videos = [Path("a.mkv"), Path("b.mkv"), Path("c.mkv")]
+
+    def fake_tracks(video):
+        return dual if video.name == "a.mkv" else single
+
+    with (
+        patch("sys.argv", ["whispersub", ".", "--list-audio-tracks"]),
+        patch("whispersub.collect_videos", return_value=videos),
+        patch("whispersub.list_audio_tracks", side_effect=fake_tracks),
+    ):
+        main()
+
+    out = capsys.readouterr().out
+    # Two files share the single-track config — label shows first file + "1 other file"
+    assert "b.mkv and 1 other file:" in out
+    # One file has the dual-track config — label shows filename only
+    assert "a.mkv:" in out
+    # Each distinct track string appears exactly once per configuration group
+    assert out.count("#1 jpn") == 1
+
+
+def test_list_audio_tracks_flag_returns_without_transcribing(capsys):
+    """--list-audio-tracks returns without loading the model."""
+    tracks = ["#0 eng aac 48000Hz stereo"]
+    with (
+        patch("sys.argv", ["whispersub", "video.mkv", "--list-audio-tracks"]),
+        patch("whispersub.collect_videos", return_value=[Path("video.mkv")]),
+        patch("whispersub.list_audio_tracks", return_value=tracks),
+    ):
+        main()  # must return normally, not call sys.exit
+
+
+def test_list_audio_tracks_flag_no_videos(capsys):
+    """--list-audio-tracks with no matching videos prints a message and returns."""
+    with (
+        patch("sys.argv", ["whispersub", "empty/", "--list-audio-tracks"]),
+        patch("whispersub.collect_videos", return_value=[]),
+    ):
+        main()
+
+
+def test_list_audio_tracks_flag_ffmpeg_error(capsys):
+    """--list-audio-tracks continues past unreadable files without exiting."""
+    with (
+        patch("sys.argv", ["whispersub", "bad.mkv", "--list-audio-tracks"]),
+        patch("whispersub.collect_videos", return_value=[Path("bad.mkv")]),
+        patch("whispersub.list_audio_tracks", side_effect=av.error.InvalidDataError(1, "Invalid data")),
+    ):
+        main()  # must not raise
