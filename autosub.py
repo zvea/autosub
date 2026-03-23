@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Transcribe videos to ASS subtitle files using faster-whisper."""
+
+import os
+# Must be set before faster_whisper/huggingface_hub are imported.
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows: no symlinks without Developer Mode
+
+import argparse
+import dataclasses
+import enum
+import itertools
+import json
+import math
+import signal
+import sys
+import tempfile
+import types
+from collections.abc import Iterable, Iterator
+from datetime import datetime
+from pathlib import Path
+from typing import Final
+
+import av
+import numpy as np
+import pysubs2
+from faster_whisper import WhisperModel
+from faster_whisper.transcribe import Segment, TranscriptionInfo, Word
+from faster_whisper.vad import VadOptions
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import BarColumn, Progress, TextColumn
+from rich.rule import Rule
+
+# ---------------------------------------------------------------------------
+# Constants and configuration
+# ---------------------------------------------------------------------------
+
+console = Console(highlight=False)
+
+_MODEL: Final = "large-v3-turbo"  # Whisper model name
+
+
+class ColourBy(enum.Enum):
+    """Which per-word attribute to use for background colour coding in console output."""
+
+    PROBABILITY = "probability"  # Whisper confidence score (default)
+    DURATION = "duration"        # duration in seconds
+
+    def __str__(self) -> str:
+        return self.value
+
+
+_VIDEO_EXTENSIONS: Final = frozenset({
+    ".avi", ".flv", ".m4v", ".mkv", ".mov",
+    ".mp4", ".mpg", ".mpeg", ".ts", ".webm", ".wmv",
+})
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class TranscribeParams:
+    """Parameters forwarded verbatim to WhisperModel.transcribe()."""
+
+    task: str = "transcribe"
+    language: str | None = None
+    multilingual: bool = True
+    word_timestamps: bool = True
+    vad_filter: bool = True  # Voice Activity Detection
+    vad_parameters: VadOptions = dataclasses.field(default_factory=lambda: VadOptions(threshold=0.3))
+
+
+_TRANSCRIBE_PARAMS: Final = TranscribeParams()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class WordRecord:
+    """Word with timestamp data, for serialisation into ASS Comment events.
+
+    Mirrors faster_whisper.Word (which is a NamedTuple and therefore not
+    directly usable with dataclasses.asdict).
+    """
+
+    start: float          # word start position in seconds
+    end: float            # word end position in seconds
+    word: str             # word text including any leading space
+    probability: float    # Whisper confidence score [0, 1]
+
+    @classmethod
+    def from_word(cls, w: Word) -> "WordRecord":
+        return cls(start=w.start, end=w.end, word=w.word, probability=w.probability)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AssCommentPayload:
+    """Payload serialised into every autosub Comment: event in the ASS output.
+
+    Only one Comment is emitted per segment. All fields beyond seg_id have
+    defaults so that fields added in the future do not break readers of older files.
+    """
+
+    seg_id: int                                       # 0-based index of the segment in the transcription
+    words: tuple[WordRecord, ...] = dataclasses.field(default_factory=tuple)  # merged word tokens
+
+
+# Per-channel weights for dialogue extraction from surround tracks.
+# Centre carries all dialogue in professionally mixed content; the front pair
+# gets a lower weight to catch tracks where dialogue bleeds into L/R.
+# LFE (bass effects) and surrounds are excluded entirely.
+_SURROUND_MIX_WEIGHTS: Final = types.MappingProxyType({
+    "FC": 1.0,  # centre - primary dialogue channel
+    "FL": 0.3,  # front left
+    "FR": 0.3,  # front right
+})
+
+# Frequently hallucinated strings to filter out
+_KNOWN_HALLUCINATIONS: Final = frozenset({
+    "Субтитры создавал DimaTorzok",  # https://github.com/openai/whisper/discussions/2372
+})
+
+# ---------------------------------------------------------------------------
+# GPU / CUDA helpers
+# ---------------------------------------------------------------------------
+
+
+def _register_nvidia_dll_directories() -> None:
+    """Add NVIDIA pip-package DLL dirs to the Windows DLL search path.
+
+    When CUDA libraries are installed via ``pip install nvidia-cublas-cu12`` etc.
+    they land in ``site-packages/nvidia/*/bin/`` which is not on PATH.  Python 3.8+
+    exposes ``os.add_dll_directory()`` so we register those dirs here before
+    CTranslate2 tries to load them.
+    """
+    import site
+    search_roots: list[str] = []
+    try:
+        search_roots.extend(site.getsitepackages())
+    except AttributeError:
+        pass
+    user_site = site.getusersitepackages()
+    if user_site:
+        search_roots.append(user_site)
+    for sp in search_roots:
+        nvidia_dir = Path(sp) / "nvidia"
+        if nvidia_dir.is_dir():
+            for pkg_dir in nvidia_dir.iterdir():
+                dll_dir = pkg_dir / "bin"
+                if dll_dir.is_dir():
+                    os.add_dll_directory(str(dll_dir))
+
+
+# File discovery
+# ---------------------------------------------------------------------------
+
+
+def find_videos(root: Path) -> Iterator[Path]:
+    """Recursively find all video files under root."""
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _VIDEO_EXTENSIONS:
+            yield p
+
+
+def collect_videos(inputs: list[str]) -> list[Path]:
+    """Resolve inputs and return a deduplicated sorted list of video files.
+
+    Files are included directly; directories are scanned recursively.
+    Exits if any path does not exist.
+    """
+    videos: set[Path] = set()
+    for i in inputs:
+        p = Path(i).resolve()
+        if not p.exists():
+            console.print(f"[red]Error:[/red] '{p}' does not exist.")
+            sys.exit(1)
+        if p.is_dir():
+            videos.update(find_videos(p))
+        else:
+            if p.suffix.lower() not in _VIDEO_EXTENSIONS:
+                console.print(f"[red]Error:[/red] '{p.name}' is not a recognised video file.")
+                sys.exit(1)
+            videos.add(p)
+    return sorted(videos)
+
+# ---------------------------------------------------------------------------
+# Console word rendering
+# ---------------------------------------------------------------------------
+
+
+def confidence_colour_hex(p: float) -> str:
+    """Return the RGB hex colour string for a word confidence probability."""
+    if p >= 0.9:
+        return "#1be91b"  # green
+    if p >= 0.6:
+        return "#ffff00"  # yellow
+    return "#da0b0b"      # red
+
+
+def duration_colour_hex(seconds: float) -> str:
+    """Return the RGB hex colour string for a word duration.
+
+    Thresholds are engineering heuristics informed by general phonetic
+    knowledge of word durations in fluent speech:
+
+    < 0.05 s  - collapsed timestamp (Whisper/alignment artefact)
+                Whisper's 20 ms resolution and DTW-based forced alignment
+                (e.g. WhisperX) can produce near-zero-width segments on failure.
+
+    ≤ 0.60 s  - normal
+                Conversational English (~150-200 wpm) gives mean word durations
+                of ~300-400 ms; 600 ms covers the large majority of tokens.
+
+    ≤ 1.00 s  - long but plausible (phrase-final / emphatic)
+                Phrase-final lengthening and stressed multi-syllable content
+                words at prosodic boundaries can approach or reach 1 s.
+
+    > 1.00 s  - almost certainly a bad timestamp
+                Single words this long are extraordinary; the aligner has most
+                likely absorbed a neighbouring pause into the word span.
+
+    Sources:
+    - Yuan, Liberman & Cieri (2006), "Towards an Integrated Understanding
+        of Speaking Rate in Conversation", ICSLP 2006.
+        https://languagelog.ldc.upenn.edu/myl/ldc/llog/icslp06_final.pdf
+    """
+    if seconds < 0.05:
+        return "#808080"  # grey - suspiciously short, likely collapsed timestamp
+    if seconds <= 0.6:
+        return "#1be91b"  # green - normal
+    if seconds <= 1.0:
+        return "#ffff00"  # yellow - long but plausible
+    return "#da0b0b"      # red - likely a bad timestamp
+
+
+# ---------------------------------------------------------------------------
+# Subtitle card construction
+# ---------------------------------------------------------------------------
+
+
+def merge_tokens(words: list[Word]) -> list[Word]:
+    """Merge continuation tokens into the preceding word.
+
+    Whisper uses GPT-2-style byte-pair encoding: a leading space marks a new
+    word, so a token without one (e.g. "'est", "'t") is a continuation of the
+    previous token. Merging them prevents splits like [c] ['est] across lines
+    or cards.
+    """
+    if not words:
+        return []
+    merged = [words[0]]
+    for w in words[1:]:
+        if not w.word.startswith(" "):
+            prev = merged[-1]
+            merged[-1] = Word(
+                start=prev.start,
+                end=w.end,
+                word=prev.word + w.word,
+                probability=min(prev.probability, w.probability),
+            )
+        else:
+            merged.append(w)
+    return merged
+
+
+def make_line_groups(words: list[Word], max_line_width: int) -> Iterator[list[Word]]:
+    """Yield groups of words that fit within max_line_width, balanced for even line lengths.
+
+    Rather than filling each line greedily, compute a target length of
+    total_chars / estimated_lines and break softly once a line reaches it.
+    This prevents lopsided cards like a full first line paired with a short tail.
+    """
+    if not words:
+        return
+    total_len = sum(len(w.word) for w in words)
+    n_lines = max(1, math.ceil(total_len / max_line_width))
+    target = total_len / n_lines
+
+    current: list[Word] = []
+    current_len = 0
+    for i, word in enumerate(words):
+        w = len(word.word)
+        if current and current_len + w > max_line_width:
+            # Hard break: word does not fit on the current line.
+            yield current
+            current = [word]
+            current_len = w
+            continue
+        current.append(word)
+        current_len += w
+        # Soft break: reached target and more words remain.
+        if current_len >= target and i < len(words) - 1:
+            yield current
+            current = []
+            current_len = 0
+    if current:
+        yield current
+
+
+def make_event(card: list[list[Word]], *, name: str) -> pysubs2.SSAEvent:
+    """Render a card (group of lines) as a single SSAEvent."""
+    start = card[0][0].start
+    end = card[-1][-1].end
+    lines = ["".join(w.word for w in line).strip() for line in card]
+    return pysubs2.SSAEvent(
+        start=pysubs2.make_time(s=start),
+        end=pysubs2.make_time(s=end),
+        text=r"\N".join(lines),
+        name=name,
+    )
+
+
+def seg_to_events(
+    seg: Segment,
+    *,
+    seg_id: int,
+    max_line_width: int,
+    max_line_count: int,
+) -> Iterator[pysubs2.SSAEvent]:
+    """Yield one SSAEvent per subtitle card, splitting long segments across multiple cards."""
+    # nsp is post-VAD, so it tends to be low for all segments and is rarely informative.
+    name = f"seg:{seg_id} logp:{seg.avg_logprob:.2f} nsp:{seg.no_speech_prob:.2f} cr:{seg.compression_ratio:.2f} t:{seg.temperature:.1f}"
+    if not seg.words:
+        yield pysubs2.SSAEvent(
+            start=pysubs2.make_time(s=seg.start),
+            end=pysubs2.make_time(s=seg.end),
+            text=seg.text.strip(),
+            name=name,
+        )
+        return
+    card: list[list[Word]] = []
+    for line in make_line_groups(seg.words, max_line_width):
+        card.append(line)
+        if len(card) >= max_line_count:
+            yield make_event(card, name=name)
+            card = []
+    if card:
+        yield make_event(card, name=name)
+
+
+def word_to_rich_text(w: Word, colour_by: ColourBy) -> str:
+    """Render a word with a Rich background colour tag based on the chosen colour mode."""
+    if colour_by is ColourBy.DURATION:
+        bg = duration_colour_hex(w.end - w.start)
+    else:
+        bg = confidence_colour_hex(w.probability)
+    # Use black text on bright backgrounds (green, yellow) for legibility regardless
+    # of the terminal's default foreground colour.
+    fg = "black" if bg in ("#1be91b", "#ffff00") else "white"
+    return f"[{fg} on {bg}]{escape(w.word)}[/]"
+
+
+def seg_to_rich_text(seg: Segment, colour_by: ColourBy) -> str:
+    """Render segment text with per-word Rich background colour markup."""
+    if not seg.words:
+        return seg.text.strip()
+    return "".join(word_to_rich_text(w, colour_by) for w in seg.words)
+
+# ---------------------------------------------------------------------------
+# Transcription and output assembly
+# ---------------------------------------------------------------------------
+
+
+def fmt_time(seconds: float) -> str:
+    """Format seconds as hh:mm:ss.t for console display."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:04.1f}"
+
+
+def list_audio_tracks(video: Path) -> list[str]:
+    """Return a human-readable description of each audio track in the file.
+
+    Tracks are numbered by their audio-local index (0, 1, 2, ...).
+    """
+    with av.open(str(video)) as container:
+        tracks = []
+        for audio_idx, stream in enumerate(container.streams.audio):
+            ctx = stream.codec_context
+            lang = stream.metadata.get("language", "und")
+            title = stream.metadata.get("title", "")
+            layout = ctx.layout.name if ctx.layout else f"{ctx.channels}ch"
+            kbps = f" {ctx.bit_rate // 1000}kbps" if ctx.bit_rate else ""
+            profile = f" {ctx.profile}" if ctx.profile else ""
+            label = f"#{audio_idx} {lang} {ctx.name}{profile} {ctx.sample_rate}Hz {layout}{kbps}"
+            if title:
+                label += f' "{title}"'
+            tracks.append(label)
+        return tracks
+
+
+def print_tracks(progress: Progress, tracks: list[str], selected: int) -> None:
+    """Print all audio tracks, highlighting the selected one."""
+    for audio_idx, track in enumerate(tracks):
+        if audio_idx == selected:
+            progress.console.print(f"  audio track: [cyan]{track}[/cyan] [green](transcribing)[/green]")
+        else:
+            progress.console.print(f"  audio track: [dim]{track}[/dim]")
+
+
+def extract_audio(video: Path, stream_index: int = 0, *, progress: Progress) -> np.ndarray:
+    """Decode the audio track at stream_index and return a mono float32 array at 16 kHz.
+
+    16 kHz mono float32 is required by the Whisper API when passing a numpy array.
+    For surround layouts the channels are kept intact during decoding and then
+    mixed down using _SURROUND_MIX_WEIGHTS, giving centre a high weight and the
+    front pair a lower weight so that dialogue-in-fronts tracks still work.
+    Mono and stereo sources use libav's default downmix to a single channel.
+
+    Each decoded chunk is mixed to mono and written immediately to a temp file as
+    raw float32 bytes, then loaded in one shot via np.fromfile.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".f32", delete=False)
+    try:
+        with av.open(str(video)) as container:
+            stream = container.streams.audio[stream_index]
+            channel_names = [ch.name for ch in stream.codec_context.layout.channels]
+            is_surround = "FC" in channel_names
+            target_layout = stream.codec_context.layout if is_surround else "mono"
+            resampler = av.AudioResampler(format="fltp", layout=target_layout, rate=16000)
+            weights = np.array(
+                [_SURROUND_MIX_WEIGHTS.get(ch, 0.0) for ch in channel_names],
+                dtype=np.float32,
+            )
+            if is_surround:
+                if weights.sum() == 0:
+                    weights = np.ones(len(channel_names), dtype=np.float32)
+                weights /= weights.sum()
+
+            def write_chunk(frame_array: np.ndarray) -> None:
+                """Mix (channels, samples) down to mono and append to tmp."""
+                mono = (frame_array * weights[:, np.newaxis]).sum(axis=0) if is_surround else frame_array[0]
+                mono.tofile(tmp)
+
+            duration = container.duration / 1_000_000 if container.duration else None
+            total_label = f"{int(duration / 60)} minutes" if duration else "unknown"
+            task = progress.add_task("Remuxing audio:", total=duration, total_label=total_label)
+            for frame in container.decode(stream):
+                progress.update(task, completed=frame.time)
+                for resampled in resampler.resample(frame):
+                    write_chunk(resampled.to_ndarray())
+            for resampled in resampler.resample(None):
+                write_chunk(resampled.to_ndarray())
+            progress.remove_task(task)
+
+        tmp.close()
+        return np.fromfile(tmp.name, dtype=np.float32)
+    finally:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def transcribe(video: Path, model: WhisperModel, stream_index: int, *, progress: Progress) -> tuple[Iterable[Segment], TranscriptionInfo]:
+    """Decode audio from video, then transcribe and return (segments, info)."""
+    audio = extract_audio(video, stream_index, progress=progress)
+    kwargs = {f.name: getattr(_TRANSCRIBE_PARAMS, f.name) for f in dataclasses.fields(_TRANSCRIBE_PARAMS)}
+    return model.transcribe(audio, **kwargs)
+
+
+def set_script_info(subs: pysubs2.SSAFile, info: TranscriptionInfo, video: Path) -> None:
+    """Write Whisper transcription metadata into [Script Info]."""
+    # Top language probabilities - useful for spotting code-switching in multilingual content.
+    top_langs = sorted(info.all_language_probs or [], key=lambda x: x[1], reverse=True)[:5]
+    lang_summary = ", ".join(f"{lang} {p:.1%}" for lang, p in top_langs)
+    subs.info["X-Source"] = video.name
+    subs.info["X-Transcribed-At"] = datetime.now().isoformat(timespec="seconds")
+    subs.info["X-Language"] = f"{info.language} ({info.language_probability:.1%})"
+    subs.info["X-Languages"] = lang_summary
+    # Duration after VAD (voice activity detection) vs total - large gap indicates heavy noise or silence.
+    subs.info["X-Duration"] = f"{fmt_time(info.duration)} (speech: {fmt_time(info.duration_after_vad)})"
+    subs.info["X-Model"] = _MODEL
+    subs.info["X-Transcribe-Params"] = repr(_TRANSCRIBE_PARAMS)
+
+
+def make_segment_comment(seg: Segment, seg_id: int) -> pysubs2.SSAEvent | None:
+    """Create a Comment: ASS event carrying word-level timestamps for a segment.
+
+    The event is given the segment's start/end positions so it sorts alongside its
+    Dialogue counterpart. Players ignore Comment: events entirely; they exist
+    solely so tooling can read word timestamps back from the file.
+    Returns None if the segment has no word timestamps.
+    """
+    if not seg.words:
+        return None
+    payload = AssCommentPayload(
+        seg_id=seg_id,
+        words=tuple(WordRecord.from_word(w) for w in seg.words),
+    )
+    return pysubs2.SSAEvent(
+        start=pysubs2.make_time(s=seg.start),
+        end=pysubs2.make_time(s=seg.end),
+        text=json.dumps(dataclasses.asdict(payload), ensure_ascii=False),
+        type="Comment",
+    )
+
+
+def format_segment_for_console(seg: Segment, colour_by: ColourBy) -> str:
+    """Format a segment as a Rich-markup string showing its timestamp and colour-coded text."""
+    return f"  [dim]{fmt_time(seg.start)}→{fmt_time(seg.end)}[/dim] {seg_to_rich_text(seg, colour_by)}"
+
+
+def build_subs(
+    segments: Iterable[Segment],
+    *,
+    font_size: int,
+    limit: int | None,
+    colour_by: ColourBy,
+    max_line_width: int,
+    max_line_count: int,
+    info: TranscriptionInfo,
+    video: Path,
+    progress: Progress,
+) -> pysubs2.SSAFile:
+    """Consume segments and return a populated SSAFile."""
+    subs = pysubs2.SSAFile()
+    subs.info["PlayResX"] = "1280"
+    subs.info["PlayResY"] = "720"
+    subs.styles["Default"].fontsize = font_size
+    set_script_info(subs, info, video)
+    task_progress = progress.add_task("Transcribing:", total=info.duration, total_label=f"{int(info.duration / 60)} minutes")
+    for seg_id, seg in enumerate(itertools.islice(segments, limit)):
+        seg.words = merge_tokens(seg.words or [])
+        if seg.text.strip() in _KNOWN_HALLUCINATIONS:
+            progress.console.print(f"{format_segment_for_console(seg, colour_by)} [bold red](ignoring known hallucination)[/]")
+            continue
+        if comment := make_segment_comment(seg, seg_id):
+            subs.append(comment)
+        events = seg_to_events(
+            seg,
+            seg_id=seg_id,
+            max_line_width=max_line_width,
+            max_line_count=max_line_count,
+        )
+        for event in events:
+            subs.append(event)
+        progress.console.print(format_segment_for_console(seg, colour_by))
+        progress.update(task_progress, completed=seg.end)
+    progress.remove_task(task_progress)
+    return subs
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Like ArgumentDefaultsHelpFormatter but skips None and False defaults."""
+    def _get_help_string(self, action: argparse.Action) -> str | None:
+        if action.default in (None, False):
+            return action.help
+        return super()._get_help_string(action)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse and return command-line arguments."""
+    parser = argparse.ArgumentParser(description="Transcribe videos to ASS subtitles.", formatter_class=_HelpFormatter, add_help=False)
+    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
+    parser.add_argument("path", nargs="+", help="Video files or directories to scan recursively")
+    parser.add_argument("--audio-track", type=int, metavar="N", help="Audio track index to transcribe (required when a file has multiple tracks)")
+    parser.add_argument("--colour-by", type=ColourBy, default=ColourBy.PROBABILITY, choices=list(ColourBy), help="Per-word background colour coding in console output")
+    parser.add_argument("--font-size", type=int, default=48, metavar="N", help="Font size in a 1280×720 virtual canvas (scaled to actual screen resolution by the player)")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing subtitle files (default: skip)")
+    parser.add_argument("--limit", type=int, metavar="N", help="Stop after N subtitle segments per video")
+    parser.add_argument("--max-line-count", type=int, default=2, metavar="N", help="Max subtitle lines per card")
+    parser.add_argument("--max-line-width", type=int, default=36, metavar="N", help="Max characters per subtitle line")
+    parser.add_argument("--max-threads", type=int, metavar="N", help="Max CPU threads (default: all cores)")
+    parser.add_argument("--output-dir", type=Path, metavar="DIR", help="Write subtitle files here instead of alongside each video")
+    return parser.parse_args()
+
+
+def validate_audio_tracks(videos: list[Path], requested: int | None) -> None:
+    """Check audio track availability for all videos before any transcription begins.
+
+    Exits with an error if any video has no audio tracks, requires --audio-track
+    but it was not provided, or has a provided --audio-track that is out of range.
+    All problems are reported together so the user can fix them in one go.
+    """
+    errors: list[str] = []
+    for video in videos:
+        tracks = list_audio_tracks(video)
+        if not tracks:
+            errors.append(f"{video.name}: no audio tracks")
+        elif requested is None and len(tracks) > 1:
+            track_list = "\n".join(f"  {t}" for t in tracks)
+            errors.append(f"{video.name}: {len(tracks)} audio tracks - use --audio-track N to select one\n{track_list}")
+        elif requested is not None and not 0 <= requested < len(tracks):
+            valid = ", ".join(str(i) for i in range(len(tracks)))
+            errors.append(f"{video.name}: --audio-track {requested} is out of range (valid: {valid})")
+    if errors:
+        for error in errors:
+            console.print(f"[red]Error:[/red] {error}")
+        sys.exit(1)
+
+
+def process_video(
+    progress: Progress,
+    video: Path,
+    *,
+    args: argparse.Namespace,
+    model: WhisperModel,
+) -> None:
+    """Transcribe one video file and save the ASS subtitle file."""
+    tracks = list_audio_tracks(video)
+    track_index = args.audio_track if args.audio_track is not None else 0
+    print_tracks(progress, tracks, track_index)
+
+    segments, info = transcribe(video, model, track_index, progress=progress)
+    dest_dir = args.output_dir if args.output_dir else video.parent
+    dest = dest_dir / f"{video.stem}.{info.language}.ass"
+    progress.console.print(f"  detected language: [cyan]{info.language}[/cyan] ({info.language_probability:.2%})")
+    progress.console.print(f"  colour by: [cyan]{args.colour_by}[/cyan]")
+    progress.console.print(f"  output: [cyan]{dest}[/cyan]")
+    if not args.force and dest.exists():
+        progress.console.print("  [yellow]Skipping:[/yellow] subtitle already exists.")
+    else:
+        subs = build_subs(
+            segments,
+            font_size=args.font_size,
+            limit=args.limit,
+            colour_by=args.colour_by,
+            max_line_width=args.max_line_width,
+            max_line_count=args.max_line_count,
+            info=info,
+            video=video,
+            progress=progress,
+        )
+        subs.save(str(dest))
+        progress.console.print(f"  [green]Saved:[/green] {dest}")
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.output_dir and not args.output_dir.is_dir():
+        console.print(f"[red]Error:[/red] --output-dir '{args.output_dir}' does not exist.")
+        sys.exit(1)
+
+    videos = collect_videos(args.path)
+    if not videos:
+        console.print("No video files found.")
+        return
+
+    validate_audio_tracks(videos, args.audio_track)
+
+    console.print(Rule(f"Loading model: {_MODEL}"))
+    if sys.platform == "win32":
+        _register_nvidia_dll_directories()
+    try:
+        model = WhisperModel(_MODEL, compute_type="int8", cpu_threads=args.max_threads or 0)
+    except RuntimeError as exc:
+        if "not found or cannot be loaded" not in str(exc):
+            raise
+        console.print(
+            "[yellow]Warning:[/yellow] GPU/CUDA unavailable, falling back to CPU.\n"
+            "For GPU support: install CUDA 12 (nvidia.com/cuda-downloads)"
+            " or run: [bold]pip install autosub\\[gpu][/bold]"
+        )
+        model = WhisperModel(_MODEL, device="cpu", compute_type="int8", cpu_threads=args.max_threads or 0)
+
+    progress = Progress(
+        TextColumn("  [dim]{task.description}[/dim]"),
+        BarColumn(),
+        TextColumn(
+            "[progress.percentage]{task.percentage:>3.0f}%[/progress.percentage]"
+            " [dim]of[/dim] "
+            "[progress.percentage]{task.fields[total_label]}[/progress.percentage]"
+        ),
+        console=console,
+    )
+    # Register before inference so this handler wins over any SIGINT handler that
+    # CTranslate2 installs - ensuring the cursor is restored even when Ctrl-C fires
+    # inside a C extension before Python can raise KeyboardInterrupt.
+    def _sigint_handler(sig: int, frame: object) -> None:
+        console.show_cursor(True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.raise_signal(signal.SIGINT)  # Exit with 130 (128 + SIGINT).
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    with progress:
+        overall_progress = progress.add_task("Overall:", total=len(videos), total_label=f"{len(videos)} videos")
+        for i, video in enumerate(videos, 1):
+            progress.console.print(Rule(f"{i}/{len(videos)}: {video.name}"))
+            process_video(progress, video, args=args, model=model)
+            progress.update(overall_progress, advance=1)
+
+
+if __name__ == "__main__":
+    main()
