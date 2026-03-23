@@ -7,6 +7,7 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # Windows: no sym
 
 import argparse
 import dataclasses
+import importlib.metadata
 import enum
 import itertools
 import json
@@ -551,17 +552,18 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 def parse_args() -> argparse.Namespace:
     """Parse and return command-line arguments."""
     parser = argparse.ArgumentParser(description="Transcribe videos to ASS subtitles.", formatter_class=_HelpFormatter, add_help=False)
-    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
     parser.add_argument("path", nargs="+", help="Video files or directories to scan recursively")
     parser.add_argument("--audio-track", type=int, metavar="N", help="Audio track index to transcribe (required when a file has multiple tracks)")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing subtitle files (default: skip)")
+    parser.add_argument("--output-dir", type=Path, metavar="DIR", help="Write subtitle files here instead of alongside each video")
     parser.add_argument("--colour-by", type=ColourBy, default=ColourBy.PROBABILITY, choices=list(ColourBy), help="Per-word background colour coding in console output")
     parser.add_argument("--font-size", type=int, default=48, metavar="N", help="Font size in a 1280×720 virtual canvas (scaled to actual screen resolution by the player)")
-    parser.add_argument("--force", action="store_true", help="Overwrite existing subtitle files (default: skip)")
-    parser.add_argument("--limit", type=int, metavar="N", help="Stop after N subtitle segments per video")
     parser.add_argument("--max-line-count", type=int, default=2, metavar="N", help="Max subtitle lines per card")
     parser.add_argument("--max-line-width", type=int, default=36, metavar="N", help="Max characters per subtitle line")
     parser.add_argument("--max-threads", type=int, metavar="N", help="Max CPU threads (default: all cores)")
-    parser.add_argument("--output-dir", type=Path, metavar="DIR", help="Write subtitle files here instead of alongside each video")
+    parser.add_argument("--limit", type=int, metavar="N", help="Stop after N subtitle segments per video")
+    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {importlib.metadata.version('whispersub')}")
     return parser.parse_args()
 
 
