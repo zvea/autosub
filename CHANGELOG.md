@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.0 — 2026-03-26
+
+- Replaced VAD pre-filter with `hallucination_silence_threshold`, fixing dropped speech over background music/noise. May increase hallucinations over non-speech audio.
+
 ## v1.2.1 — 2026-03-23
 
 - Fixed audio track grouping and dropped bitrate from track labels in `--list-audio-tracks` output.
@@ -19,7 +23,3 @@
 ## v1.0.0 — 2026-03-23
 
 - Initial public release.
-
-## v0.1.0 — 2026-03-23
-
-- Initial commit: CLI tool for generating subtitles from video files using Whisper.
