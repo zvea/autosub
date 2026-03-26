@@ -8,7 +8,7 @@ import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import _cuda_encode_works, _offset_segment, _surround_mix_weights, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
+from whispersub import _cuda_encode_works, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -786,3 +786,183 @@ def test_offset_segment_preserves_other_fields():
     assert shifted.avg_logprob == pytest.approx(-0.3)
     assert shifted.no_speech_prob == pytest.approx(0.05)
     assert shifted.words[0].probability == pytest.approx(0.95)
+
+
+# ---------------------------------------------------------------------------
+# _transcribe_with_retry
+# ---------------------------------------------------------------------------
+
+
+def _mock_progress():
+    """Return a mock Progress whose console.print is a no-op."""
+    progress = MagicMock()
+    progress.console.print = MagicMock()
+    return progress
+
+
+def _fake_transcribe(pass_segments: list[list[Segment]]):
+    """Return a model mock whose transcribe() yields a different segment list per call.
+
+    Each call to model.transcribe() pops the next list from pass_segments and
+    returns (iter(segments), info_mock).
+    """
+    model = MagicMock()
+    call_idx = [0]
+
+    def side_effect(clip, **kwargs):
+        idx = call_idx[0]
+        call_idx[0] += 1
+        segs = pass_segments[idx] if idx < len(pass_segments) else []
+        info = MagicMock()
+        return iter(segs), info
+
+    model.transcribe.side_effect = side_effect
+    return model
+
+
+def test_retry_no_drift():
+    """When no gap exceeds the threshold, all segments are yielded with no retry."""
+    segs = [
+        make_seg(words=None, start=0.0, end=5.0),
+        make_seg(words=None, start=6.0, end=10.0),
+        make_seg(words=None, start=12.0, end=15.0),
+    ]
+    model = _fake_transcribe([segs])
+    audio = np.zeros(20 * 16_000, dtype=np.float32)
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert len(result) == 3
+    assert model.transcribe.call_count == 1
+    # Timestamps unchanged (offset=0)
+    assert result[0].start == pytest.approx(0.0)
+    assert result[2].end == pytest.approx(15.0)
+
+
+def test_retry_resets_on_drift():
+    """A gap > threshold triggers a retry; second pass fills in the missing region."""
+    # Pass 1: two segments, then a 60s gap → drift detected after seg at 10.0
+    pass1 = [
+        make_seg(words=None, start=0.0, end=5.0),
+        make_seg(words=None, start=6.0, end=10.0),
+        make_seg(words=None, start=70.0, end=75.0),  # drift: gap=60s
+    ]
+    # Pass 2: starts from offset=10.0, produces segments in the previously-missed region
+    pass2 = [
+        make_seg(words=None, start=1.0, end=5.0),    # 10+1=11 in original
+        make_seg(words=None, start=8.0, end=12.0),   # 10+8=18 in original
+    ]
+    model = _fake_transcribe([pass1, pass2])
+    audio = np.zeros(120 * 16_000, dtype=np.float32)
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert model.transcribe.call_count == 2
+    # Pass 1 yielded 2 segments, pass 2 yielded 2 (offset-adjusted)
+    assert len(result) == 4
+    assert result[0].start == pytest.approx(0.0)
+    assert result[1].end == pytest.approx(10.0)
+    assert result[2].start == pytest.approx(11.0)  # 1.0 + offset 10.0
+    assert result[3].end == pytest.approx(22.0)    # 12.0 + offset 10.0
+
+
+def test_retry_skips_when_no_speech_before_gap():
+    """When retry also starts with a gap, skip ahead instead of looping."""
+    # Pass 1: first segment starts at 50s → gap from 0, drift detected, no yield
+    pass1 = [
+        make_seg(words=None, start=50.0, end=55.0),
+    ]
+    # Pass 2: starts from offset=50.0, produces normal output
+    pass2 = [
+        make_seg(words=None, start=0.0, end=3.0),
+        make_seg(words=None, start=4.0, end=8.0),
+    ]
+    model = _fake_transcribe([pass1, pass2])
+    audio = np.zeros(120 * 16_000, dtype=np.float32)
+    progress = _mock_progress()
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=progress))
+
+    assert model.transcribe.call_count == 2
+    assert len(result) == 2
+    # Segments from pass 2 are offset by 50.0
+    assert result[0].start == pytest.approx(50.0)
+    assert result[1].end == pytest.approx(58.0)
+    # Should have printed a "skipping" message
+    progress.console.print.assert_called()
+    skip_calls = [c for c in progress.console.print.call_args_list
+                  if "no speech" in str(c)]
+    assert len(skip_calls) == 1
+
+
+def test_retry_empty_pass_terminates():
+    """If transcribe returns no segments at all, the generator terminates cleanly."""
+    model = _fake_transcribe([[]])
+    audio = np.zeros(60 * 16_000, dtype=np.float32)
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert result == []
+    assert model.transcribe.call_count == 1
+
+
+def test_retry_short_audio_skipped():
+    """Audio shorter than 1 second produces no output."""
+    model = _fake_transcribe([])
+    audio = np.zeros(8000, dtype=np.float32)  # 0.5s
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert result == []
+    assert model.transcribe.call_count == 0
+
+
+def test_retry_multiple_drifts():
+    """Multiple drift resets in sequence all recover correctly."""
+    # Pass 1: one segment then drift
+    pass1 = [
+        make_seg(words=None, start=0.0, end=5.0),
+        make_seg(words=None, start=60.0, end=65.0),  # drift
+    ]
+    # Pass 2: from offset=5.0, one segment then another drift
+    pass2 = [
+        make_seg(words=None, start=0.0, end=4.0),
+        make_seg(words=None, start=50.0, end=55.0),  # drift again
+    ]
+    # Pass 3: from offset=9.0, normal completion
+    pass3 = [
+        make_seg(words=None, start=0.0, end=3.0),
+    ]
+    model = _fake_transcribe([pass1, pass2, pass3])
+    audio = np.zeros(120 * 16_000, dtype=np.float32)
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert model.transcribe.call_count == 3
+    assert len(result) == 3
+    assert result[0].start == pytest.approx(0.0)   # pass 1
+    assert result[0].end == pytest.approx(5.0)
+    assert result[1].start == pytest.approx(5.0)   # pass 2: 0.0 + offset 5.0
+    assert result[1].end == pytest.approx(9.0)     # 4.0 + offset 5.0
+    assert result[2].start == pytest.approx(9.0)   # pass 3: 0.0 + offset 9.0
+    assert result[2].end == pytest.approx(12.0)    # 3.0 + offset 9.0
+
+
+def test_retry_offsets_words():
+    """Word timestamps are offset-adjusted on retry passes."""
+    pass1 = [
+        make_seg(words=[w(" hi", 0.0, 2.0)], start=0.0, end=2.0),
+        make_seg(words=None, start=50.0, end=55.0),  # drift
+    ]
+    pass2 = [
+        make_seg(words=[w(" there", 1.0, 3.0)], start=1.0, end=3.0),
+    ]
+    model = _fake_transcribe([pass1, pass2])
+    audio = np.zeros(60 * 16_000, dtype=np.float32)
+
+    result = list(_transcribe_with_retry(audio, model, {}, progress=_mock_progress()))
+
+    assert len(result) == 2
+    assert result[0].words[0].start == pytest.approx(0.0)  # no offset
+    assert result[1].words[0].start == pytest.approx(3.0)  # 1.0 + offset 2.0
+    assert result[1].words[0].end == pytest.approx(5.0)    # 3.0 + offset 2.0
