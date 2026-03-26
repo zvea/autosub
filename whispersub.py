@@ -454,11 +454,90 @@ def extract_audio(video: Path, stream_index: int = 0, *, progress: Progress) -> 
         Path(tmp.name).unlink(missing_ok=True)
 
 
+_DRIFT_THRESHOLD: Final = 30
+"""Seconds of silence between segments before assuming the decoder has drifted.
+
+When the gap between two consecutive segments exceeds this value the current
+transcription pass is abandoned and a fresh one starts from the beginning of
+the gap.  This recovers from Whisper's attention-based decoder losing its
+position in long audio without relying on VAD pre-filtering (which can drop
+speech).
+"""
+
+
+def _offset_segment(seg: Segment, offset: float) -> Segment:
+    """Return a copy of *seg* with all timestamps shifted forward by *offset* seconds."""
+    words = None
+    if seg.words:
+        words = [dataclasses.replace(w, start=w.start + offset, end=w.end + offset) for w in seg.words]
+    return dataclasses.replace(seg, start=seg.start + offset, end=seg.end + offset, words=words)
+
+
+def _transcribe_with_retry(
+    audio: np.ndarray,
+    model: WhisperModel,
+    kwargs: dict,
+    *,
+    progress: Progress,
+) -> Iterator[Segment]:
+    """Yield segments, retrying from a fresh decoder state when drift is detected.
+
+    Drift is detected when consecutive segments are separated by more than
+    _DRIFT_THRESHOLD seconds.  On retry the audio is sliced from the start of
+    the gap so the decoder gets a fresh context.  To avoid infinite loops, if a
+    retry produces no output before the same drift point the gap is skipped and
+    the next region is tried.
+    """
+    sample_rate = 16_000
+    total_duration = len(audio) / sample_rate
+    offset = 0.0  # cumulative offset into the original audio
+
+    while offset < total_duration:
+        start_sample = int(offset * sample_rate)
+        clip = audio[start_sample:]
+        if len(clip) < sample_rate:  # less than 1 s remaining
+            break
+
+        segments, _info = model.transcribe(clip, **kwargs)
+        last_end = 0.0  # end of most recent yielded segment (relative to clip)
+        yielded_any = False
+
+        for seg in segments:
+            gap = seg.start - last_end
+            if gap > _DRIFT_THRESHOLD:
+                # Decoder likely drifted.  Restart from where output stopped.
+                drift_point = offset + last_end
+                if not yielded_any:
+                    # Retry produced nothing before the same gap — skip ahead
+                    # to the segment the decoder jumped to, to avoid looping.
+                    progress.console.print(
+                        f"  [yellow]Drift:[/yellow] no speech in "
+                        f"{fmt_time(offset)}–{fmt_time(offset + seg.start)}, skipping"
+                    )
+                    offset = offset + seg.start
+                else:
+                    progress.console.print(
+                        f"  [yellow]Drift:[/yellow] resetting decoder at {fmt_time(drift_point)}"
+                    )
+                    offset = drift_point
+                break  # abandon this pass, retry from new offset
+            yield _offset_segment(seg, offset)
+            last_end = seg.end
+            yielded_any = True
+        else:
+            # Generator exhausted normally — we're done.
+            break
+
+
 def transcribe(video: Path, model: WhisperModel, stream_index: int, *, progress: Progress) -> tuple[Iterable[Segment], TranscriptionInfo]:
     """Decode audio from video, then transcribe and return (segments, info)."""
     audio = extract_audio(video, stream_index, progress=progress)
     kwargs = {f.name: getattr(_TRANSCRIBE_PARAMS, f.name) for f in dataclasses.fields(_TRANSCRIBE_PARAMS)}
-    return model.transcribe(audio, **kwargs)
+    segments, info = model.transcribe(audio, **kwargs)
+    # Wrap in the drift-retry generator; the first pass's segments feed into it
+    # but we need to call transcribe fresh on retry, so we pass audio + kwargs.
+    # Re-do the initial call inside the generator for uniform handling.
+    return _transcribe_with_retry(audio, model, kwargs, progress=progress), info
 
 
 def set_script_info(subs: pysubs2.SSAFile, info: TranscriptionInfo, video: Path) -> None:
