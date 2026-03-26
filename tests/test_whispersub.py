@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,7 @@ import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import _cuda_encode_works, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, merge_tokens, seg_to_events, validate_audio_tracks
+from whispersub import AssCommentPayload, _cuda_encode_works, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, make_segment_comment, merge_tokens, seg_to_events, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -746,6 +747,61 @@ def test_is_hallucination_empty_string():
 def test_is_hallucination_korean():
     """Korean YouTube outro hallucination is detected."""
     assert is_hallucination("다음 영상에서 만나요") is True
+
+
+# ---------------------------------------------------------------------------
+# make_segment_comment
+# ---------------------------------------------------------------------------
+
+
+def _make_seg(text: str = "hello world", start: float = 1.0, end: float = 3.0, words=None):
+    """Helper to build a Segment with optional word-level data."""
+    if words is None:
+        words = [w("hello", 1.0, 2.0), w(" world", 2.0, 3.0)]
+    return Segment(
+        id=0, seek=0, start=start, end=end, text=text, tokens=[],
+        avg_logprob=-0.3, compression_ratio=1.2, no_speech_prob=0.01,
+        words=words, temperature=0.0,
+    )
+
+
+def test_make_segment_comment_basic():
+    """A segment with words produces a Comment event with seg_id and words."""
+    seg = _make_seg()
+    comment = make_segment_comment(seg, seg_id=5)
+    assert comment is not None
+    assert comment.type == "Comment"
+    payload = json.loads(comment.text)
+    assert payload["seg_id"] == 5
+    assert len(payload["words"]) == 2
+    assert payload["filtered"] is None
+
+
+def test_make_segment_comment_no_words_returns_none():
+    """A segment without word timestamps returns None."""
+    seg = _make_seg(words=[])
+    assert make_segment_comment(seg, seg_id=0) is None
+
+
+def test_make_segment_comment_filtered_hallucination():
+    """When filtered is set, the comment carries the filter reason."""
+    seg = _make_seg(text="Субтитры создавал DimaTorzok")
+    comment = make_segment_comment(seg, seg_id=2, filtered="hallucination")
+    assert comment is not None
+    assert comment.type == "Comment"
+    payload = json.loads(comment.text)
+    assert payload["seg_id"] == 2
+    assert payload["filtered"] == "hallucination"
+    assert len(payload["words"]) == 2
+
+
+def test_make_segment_comment_filtered_preserves_timing():
+    """Filtered comments still carry the segment's start/end timing."""
+    seg = _make_seg(start=10.5, end=12.0)
+    comment = make_segment_comment(seg, seg_id=0, filtered="hallucination")
+    assert comment is not None
+    assert comment.start == pysubs2.make_time(s=10.5)
+    assert comment.end == pysubs2.make_time(s=12.0)
 
 
 # ---------------------------------------------------------------------------

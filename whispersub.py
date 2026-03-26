@@ -100,6 +100,7 @@ class AssCommentPayload:
 
     seg_id: int                                       # 0-based index of the segment in the transcription
     words: tuple[WordRecord, ...] = dataclasses.field(default_factory=tuple)  # merged word tokens
+    filtered: str | None = None                       # None = kept; otherwise the reason it was excluded (e.g. "hallucination")
 
 
 # Per-channel weights for dialogue extraction from surround tracks.
@@ -131,7 +132,10 @@ def _surround_mix_weights(channel_names: list[str]) -> np.ndarray:
 # variations (e.g. trailing period vs none) don't slip through.
 _KNOWN_HALLUCINATIONS: Final = frozenset({
     "субтитры создавал dimatorzok",   # https://github.com/openai/whisper/discussions/2372
+    "субтитры подогнал «симон»",      # "Subtitles by Simon" (Russian attribution)
+    "продолжение следует",            # "To be continued" (Russian)
     "다음 영상에서 만나요",             # "See you in the next video" (Korean YouTube outro)
+    "ご視聴ありがとうございました",      # "Thank you for watching" (Japanese YouTube outro)
 })
 
 
@@ -567,7 +571,7 @@ def set_script_info(subs: pysubs2.SSAFile, info: TranscriptionInfo, video: Path)
     subs.info["X-Transcribe-Params"] = repr(_TRANSCRIBE_PARAMS)
 
 
-def make_segment_comment(seg: Segment, seg_id: int) -> pysubs2.SSAEvent | None:
+def make_segment_comment(seg: Segment, seg_id: int, *, filtered: str | None = None) -> pysubs2.SSAEvent | None:
     """Create a Comment: ASS event carrying word-level timestamps for a segment.
 
     The event is given the segment's start/end positions so it sorts alongside its
@@ -580,6 +584,7 @@ def make_segment_comment(seg: Segment, seg_id: int) -> pysubs2.SSAEvent | None:
     payload = AssCommentPayload(
         seg_id=seg_id,
         words=tuple(WordRecord.from_word(w) for w in seg.words),
+        filtered=filtered,
     )
     return pysubs2.SSAEvent(
         start=pysubs2.make_time(s=seg.start),
@@ -617,6 +622,8 @@ def build_subs(
         seg.words = merge_tokens(seg.words or [])
         if is_hallucination(seg.text):
             progress.console.print(f"{format_segment_for_console(seg, colour_by)} [bold red](ignoring known hallucination)[/]")
+            if comment := make_segment_comment(seg, seg_id, filtered="hallucination"):
+                subs.append(comment)
             continue
         if comment := make_segment_comment(seg, seg_id):
             subs.append(comment)
