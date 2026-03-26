@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.4.0 — 2026-03-26
+
+- Detect decoder drift in long audio and automatically retry from a fresh state, fixing transcriptions that silently stop producing output partway through.
+- Normalize hallucination matching (case-insensitive, punctuation-tolerant) and add Korean YouTube outro string.
+
 ## v1.3.1 — 2026-03-26
 
 - Fixed CPU fallback on Windows.
