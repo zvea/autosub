@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.1 — 2026-03-26
+
+- Replace decoder echo detection with gap-based duplicate check (consecutive identical segment with gap > 5s), which catches the actual failure pattern.
+- Write subtitles atomically via a `.new` temp file to avoid losing good backups if transcription fails.
+- Record whispersub version in ASS output as `X-Version`.
+- Fix `UnicodeEncodeError` on Windows when saving non-ASCII subtitles.
+
 ## v1.5.0 — 2026-03-26
 
 - Detect wrong-script output and decoder loops as signs of drift, expanding on the gap-based detection from v1.4.0.
