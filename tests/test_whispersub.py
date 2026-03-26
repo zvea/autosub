@@ -571,6 +571,67 @@ def test_rotate_backups_no_print_without_console(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# safe_save
+# ---------------------------------------------------------------------------
+
+
+def test_safe_save_new_file(tmp_path):
+    """Writing to a path that doesn't exist creates it directly."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    safe_save("new content", dest, keep=3)
+    assert dest.read_text() == "new content"
+    assert not Path(str(dest) + ".new").exists()
+
+
+def test_safe_save_overwrites_with_backup(tmp_path):
+    """Overwriting an existing file creates a .bak before replacing."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("old content")
+    safe_save("new content", dest, keep=3)
+    assert dest.read_text() == "new content"
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "old content"
+    assert not Path(str(dest) + ".new").exists()
+
+
+def test_safe_save_no_backup_lost_on_write_failure(tmp_path):
+    """If writing the .new file fails, the original is untouched."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("precious content")
+    # Write to a non-writable directory to simulate failure
+    bad_dest = Path("/dev/null/impossible.ass")
+    try:
+        safe_save("new content", bad_dest, keep=3)
+    except OSError:
+        pass
+    # Original still intact
+    assert dest.read_text() == "precious content"
+    assert not (tmp_path / "movie.de.ass.bak").exists()
+
+
+def test_safe_save_no_orphan_new_file(tmp_path):
+    """The .new temp file is cleaned up even on success."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    safe_save("content", dest, keep=3)
+    assert not Path(str(dest) + ".new").exists()
+
+
+def test_safe_save_backup_chain(tmp_path):
+    """Multiple overwrites produce correct .bak chain."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    safe_save("v1", dest, keep=3)
+    safe_save("v2", dest, keep=3)
+    safe_save("v3", dest, keep=3)
+    assert dest.read_text() == "v3"
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v2"
+    assert (tmp_path / "movie.de.ass.bak.1").read_text() == "v1"
+
+
+# ---------------------------------------------------------------------------
 # validate_audio_tracks
 # ---------------------------------------------------------------------------
 

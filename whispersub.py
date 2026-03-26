@@ -813,6 +813,20 @@ def rotate_backups(dest: Path, keep: int, *, console: Console | None = None) -> 
         console.print(f"  [green]Backup:[/green] {dest.name} → {bak.name}")
 
 
+def safe_save(content: str, dest: Path, keep: int, *, console: Console | None = None) -> None:
+    """Write *content* to *dest* atomically, rotating backups first.
+
+    Writes to a temporary ``.new`` file first, then rotates any existing
+    *dest* into the ``.bak`` chain, and finally renames ``.new`` → *dest*.
+    If the write fails, the original file is never touched.
+    """
+    new_path = Path(str(dest) + ".new")
+    new_path.write_text(content)
+    if dest.exists():
+        rotate_backups(dest, keep, console=console)
+    new_path.rename(dest)
+
+
 def process_video(
     progress: Progress,
     video: Path,
@@ -834,8 +848,6 @@ def process_video(
     if not args.force and dest.exists():
         progress.console.print("  [yellow]Skipping:[/yellow] subtitle already exists.")
     else:
-        if args.force and dest.exists():
-            rotate_backups(dest, args.keep, console=progress.console)
         subs = build_subs(
             segments,
             font_size=args.font_size,
@@ -847,7 +859,7 @@ def process_video(
             video=video,
             progress=progress,
         )
-        subs.save(str(dest))
+        safe_save(subs.to_string("ass"), dest, args.keep, console=progress.console)
         progress.console.print(f"  [green]Saved:[/green] {dest}")
 
 
