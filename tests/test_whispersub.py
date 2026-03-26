@@ -631,6 +631,15 @@ def test_safe_save_backup_chain(tmp_path):
     assert (tmp_path / "movie.de.ass.bak.1").read_text() == "v1"
 
 
+def test_safe_save_unicode(tmp_path):
+    """Non-ASCII content (CJK, Cyrillic, etc.) is written correctly as UTF-8."""
+    from whispersub import safe_save
+    dest = tmp_path / "movie.de.ass"
+    content = "Büro ist wie Achterbahnfahren\nご視聴ありがとうございました\nСубтитры создавал"
+    safe_save(content, dest, keep=3)
+    assert dest.read_text(encoding="utf-8") == content
+
+
 # ---------------------------------------------------------------------------
 # validate_audio_tracks
 # ---------------------------------------------------------------------------

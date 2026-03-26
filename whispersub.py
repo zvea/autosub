@@ -821,7 +821,7 @@ def safe_save(content: str, dest: Path, keep: int, *, console: Console | None = 
     If the write fails, the original file is never touched.
     """
     new_path = Path(str(dest) + ".new")
-    new_path.write_text(content)
+    new_path.write_text(content, encoding="utf-8")
     if dest.exists():
         rotate_backups(dest, keep, console=console)
     new_path.rename(dest)
