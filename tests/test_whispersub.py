@@ -9,7 +9,7 @@ import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import AssCommentPayload, _cuda_encode_works, _detect_drift, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, make_segment_comment, merge_tokens, rotate_backups, seg_to_events, validate_audio_tracks
+from whispersub import AssCommentPayload, _cuda_encode_works, _detect_drift, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, make_segment_comment, merge_tokens, rotate_backups, seg_to_events, set_script_info, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -674,6 +674,41 @@ def test_list_audio_tracks_flag_ffmpeg_error(capsys):
         patch("whispersub.list_audio_tracks", side_effect=av.error.InvalidDataError(1, "Invalid data")),
     ):
         main()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# set_script_info
+# ---------------------------------------------------------------------------
+
+
+def test_set_script_info_contains_version():
+    """The X-Version field is set to the installed package version."""
+    subs = pysubs2.SSAFile()
+    info = MagicMock()
+    info.language = "de"
+    info.language_probability = 0.999
+    info.all_language_probs = [("de", 0.999), ("en", 0.001)]
+    info.duration = 120.0
+    set_script_info(subs, info, Path("movie.mkv"))
+    assert "X-Version" in subs.info
+    # Should be a valid version string (not empty)
+    assert len(subs.info["X-Version"]) > 0
+
+
+def test_set_script_info_fields():
+    """All expected X- fields are populated."""
+    subs = pysubs2.SSAFile()
+    info = MagicMock()
+    info.language = "en"
+    info.language_probability = 0.95
+    info.all_language_probs = [("en", 0.95), ("fr", 0.05)]
+    info.duration = 300.0
+    set_script_info(subs, info, Path("test.mkv"))
+    for field in ["X-Source", "X-Transcribed-At", "X-Language", "X-Languages",
+                  "X-Duration", "X-Model", "X-Version", "X-Transcribe-Params"]:
+        assert field in subs.info, f"{field} missing"
+    assert subs.info["X-Source"] == "test.mkv"
+    assert "en" in subs.info["X-Language"]
 
 
 # ---------------------------------------------------------------------------

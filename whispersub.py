@@ -630,6 +630,7 @@ def set_script_info(subs: pysubs2.SSAFile, info: TranscriptionInfo, video: Path)
     subs.info["X-Languages"] = lang_summary
     subs.info["X-Duration"] = f"{fmt_time(info.duration)}"
     subs.info["X-Model"] = _MODEL
+    subs.info["X-Version"] = importlib.metadata.version("whispersub")
     subs.info["X-Transcribe-Params"] = repr(_TRANSCRIBE_PARAMS)
 
 
