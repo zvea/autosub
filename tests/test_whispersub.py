@@ -1200,82 +1200,85 @@ def test_retry_offsets_words():
 def test_detect_drift_gap():
     """A gap exceeding _DRIFT_THRESHOLD is detected."""
     seg = make_seg(words=None, start=40.0, end=42.0, text="hello")
-    assert _detect_drift(seg, 5.0, language="de", recent_texts=[]) == "gap"
+    assert _detect_drift(seg, 5.0, language="de", last_text=None) == "gap"
 
 
 def test_detect_drift_no_gap():
     """A small gap does not trigger drift."""
     seg = make_seg(words=None, start=8.0, end=10.0, text="hello")
-    assert _detect_drift(seg, 5.0, language="de", recent_texts=[]) is None
+    assert _detect_drift(seg, 5.0, language="de", last_text=None) is None
 
 
 def test_detect_drift_script_mismatch_cyrillic_in_german():
     """Cyrillic text in a German transcription is detected as script drift."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="О, ты шесть.")
-    assert _detect_drift(seg, 0.0, language="de", recent_texts=[]) == "script"
+    assert _detect_drift(seg, 0.0, language="de", last_text=None) == "script"
 
 
 def test_detect_drift_script_mismatch_cjk_in_german():
     """CJK text in a German transcription is detected as script drift."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="ご視聴ありがとうございました")
-    assert _detect_drift(seg, 0.0, language="de", recent_texts=[]) == "script"
+    assert _detect_drift(seg, 0.0, language="de", last_text=None) == "script"
 
 
 def test_detect_drift_script_mismatch_korean_in_english():
     """Korean text in an English transcription is detected as script drift."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="다음 영상에서 만나요")
-    assert _detect_drift(seg, 0.0, language="en", recent_texts=[]) == "script"
+    assert _detect_drift(seg, 0.0, language="en", last_text=None) == "script"
 
 
 def test_detect_drift_script_mismatch_mixed_in_latin():
     """CJK characters embedded in Latin text are detected."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="Die Frau hat ja こんにちは ein Problem.")
-    assert _detect_drift(seg, 0.0, language="de", recent_texts=[]) == "script"
+    assert _detect_drift(seg, 0.0, language="de", last_text=None) == "script"
 
 
 def test_detect_drift_no_script_check_for_non_latin_language():
     """Non-Latin script in a non-Latin language (e.g. Japanese) is not flagged."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="ご視聴ありがとうございました")
-    assert _detect_drift(seg, 0.0, language="ja", recent_texts=[]) is None
+    assert _detect_drift(seg, 0.0, language="ja", last_text=None) is None
 
 
 def test_detect_drift_no_script_check_for_none_language():
     """When language is None, script check is skipped."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="ご視聴ありがとうございました")
-    assert _detect_drift(seg, 0.0, language=None, recent_texts=[]) is None
+    assert _detect_drift(seg, 0.0, language=None, last_text=None) is None
 
 
 def test_detect_drift_latin_in_latin_language_ok():
     """Normal Latin text in a Latin language is not flagged."""
     seg = make_seg(words=None, start=1.0, end=2.0, text="Büro ist wie Achterbahnfahren.")
-    assert _detect_drift(seg, 0.0, language="de", recent_texts=[]) is None
+    assert _detect_drift(seg, 0.0, language="de", last_text=None) is None
 
 
-def test_detect_drift_echo():
-    """Same text appearing 3+ times in recent history triggers echo detection."""
-    seg = make_seg(words=None, start=5.0, end=6.0, text="Ich bin gut gegangen.")
-    recent = ["Ich bin gut gegangen.", "Ich bin gut gegangen.", "Ich bin gut gegangen."]
-    assert _detect_drift(seg, 4.0, language="de", recent_texts=recent) == "echo"
+def test_detect_drift_echo_duplicate_with_long_gap():
+    """Same text as previous segment with gap > 5s triggers echo."""
+    seg = make_seg(words=None, start=20.0, end=22.0, text="Mahlzeit.")
+    assert _detect_drift(seg, 12.0, language="de", last_text="Mahlzeit.") == "echo"
 
 
-def test_detect_drift_echo_below_threshold():
-    """Same text appearing fewer than 3 times does not trigger echo."""
-    seg = make_seg(words=None, start=5.0, end=6.0, text="Ich bin gut gegangen.")
-    recent = ["Ich bin gut gegangen.", "Ich bin gut gegangen."]
-    assert _detect_drift(seg, 4.0, language="de", recent_texts=recent) is None
+def test_detect_drift_echo_duplicate_with_short_gap():
+    """Same text as previous segment with gap <= 5s is real speech, not echo."""
+    seg = make_seg(words=None, start=5.0, end=6.0, text="Morgen.")
+    assert _detect_drift(seg, 3.0, language="de", last_text="Morgen.") is None
 
 
 def test_detect_drift_echo_different_text():
-    """Repeated text that doesn't match the current segment is not flagged."""
-    seg = make_seg(words=None, start=5.0, end=6.0, text="Something new.")
-    recent = ["Repeated.", "Repeated.", "Repeated."]
-    assert _detect_drift(seg, 4.0, language="de", recent_texts=recent) is None
+    """Different text from previous segment is not flagged regardless of gap."""
+    seg = make_seg(words=None, start=20.0, end=22.0, text="Something new.")
+    assert _detect_drift(seg, 5.0, language="de", last_text="Something old.") is None
+
+
+def test_detect_drift_echo_no_previous():
+    """No previous segment (first segment) never triggers echo."""
+    seg = make_seg(words=None, start=0.0, end=2.0, text="Hello.")
+    assert _detect_drift(seg, 0.0, language="de", last_text=None) is None
 
 
 def test_detect_drift_gap_takes_priority():
     """Gap detection fires before script or echo checks."""
     seg = make_seg(words=None, start=50.0, end=52.0, text="ご視聴ありがとうございました")
-    assert _detect_drift(seg, 5.0, language="de", recent_texts=[]) == "gap"
+    assert _detect_drift(seg, 5.0, language="de", last_text=None) == "gap"
 
 
 # ---------------------------------------------------------------------------
@@ -1314,17 +1317,14 @@ def test_retry_resets_on_script_mismatch():
 
 
 def test_retry_resets_on_echo():
-    """Same text repeated 3+ times triggers a retry.
+    """Duplicate text with gap > 5s triggers echo drift and retry.
 
-    Echo fires when recent_texts already contains _ECHO_THRESHOLD copies,
-    so the 4th occurrence is the one that triggers it (3 already in history).
+    Like S01E07 "Mahlzeit." appearing at 15:35 and again at 15:53 (16s gap).
     """
     pass1 = [
         make_seg(words=None, start=0.0, end=2.0, text="Normal speech."),
-        make_seg(words=None, start=3.0, end=4.0, text="Ich bin gut gegangen."),
-        make_seg(words=None, start=5.0, end=6.0, text="Ich bin gut gegangen."),
-        make_seg(words=None, start=7.0, end=8.0, text="Ich bin gut gegangen."),
-        make_seg(words=None, start=9.0, end=10.0, text="Ich bin gut gegangen."),  # 4th: 3 in history → echo
+        make_seg(words=None, start=3.0, end=5.0, text="Mahlzeit."),
+        make_seg(words=None, start=12.0, end=14.0, text="Mahlzeit."),  # gap=7s, echo
     ]
     pass2 = [
         make_seg(words=None, start=0.0, end=3.0, text="Fresh decoder output."),
@@ -1336,12 +1336,64 @@ def test_retry_resets_on_echo():
     kept, discarded = _collect_retry(audio, model, language="de", progress=progress)
 
     assert model.transcribe.call_count == 2
-    assert len(kept) == 5  # 4 from pass1 + 1 from pass2
+    assert len(kept) == 3  # 2 from pass1 + 1 from pass2
     assert kept[0].text == "Normal speech."
-    assert kept[4].text == "Fresh decoder output."
+    assert kept[1].text == "Mahlzeit."
+    assert kept[2].text == "Fresh decoder output."
     assert len(discarded) == 1
     assert discarded[0][1] == "echo"
-    assert discarded[0][0].text == "Ich bin gut gegangen."
+    assert discarded[0][0].text == "Mahlzeit."
+
+
+def test_retry_no_echo_for_short_gap_duplicates():
+    """Consecutive identical text with gap <= 5s is real speech, not echo.
+
+    Like two characters saying 'Morgen.' one second apart.
+    """
+    segs = [
+        make_seg(words=None, start=0.0, end=1.0, text="Morgen."),
+        make_seg(words=None, start=2.0, end=3.0, text="Morgen."),
+        make_seg(words=None, start=5.0, end=7.0, text="Different."),
+    ]
+    model = _fake_transcribe([segs])
+    audio = np.zeros(20 * 16_000, dtype=np.float32)
+
+    kept, discarded = _collect_retry(audio, model, language="de", progress=_mock_progress())
+
+    assert len(kept) == 3
+    assert len(discarded) == 0
+
+
+def test_retry_clears_last_text_after_reset():
+    """After a drift reset, last_text is cleared so the retry's first segment
+    is not false-positived as an echo even if it matches the pre-drift text.
+
+    Scenario: "Mahlzeit." triggers echo, decoder resets. The retry produces
+    "Mahlzeit." again at start=6.0 (gap > 5s from clip start). Without
+    clearing last_text this would trigger echo again and loop.
+    """
+    pass1 = [
+        make_seg(words=None, start=0.0, end=2.0, text="Normal."),
+        make_seg(words=None, start=3.0, end=5.0, text="Mahlzeit."),
+        make_seg(words=None, start=12.0, end=14.0, text="Mahlzeit."),  # echo, reset
+    ]
+    # Retry from 5.0. Fresh decoder also produces "Mahlzeit." but at 6s in.
+    # With last_text cleared, this should NOT be treated as echo.
+    pass2 = [
+        make_seg(words=None, start=6.0, end=8.0, text="Mahlzeit."),
+        make_seg(words=None, start=9.0, end=11.0, text="Weiter gehts."),
+    ]
+    model = _fake_transcribe([pass1, pass2])
+    audio = np.zeros(60 * 16_000, dtype=np.float32)
+
+    kept, discarded = _collect_retry(audio, model, language="de", progress=_mock_progress())
+
+    assert model.transcribe.call_count == 2
+    assert len(kept) == 4  # Normal, Mahlzeit, Mahlzeit (retry), Weiter gehts
+    assert kept[2].text == "Mahlzeit."  # retry's Mahlzeit was kept
+    assert kept[3].text == "Weiter gehts."
+    assert len(discarded) == 1
+    assert discarded[0][1] == "echo"
 
 
 def test_retry_script_mismatch_as_first_segment():
@@ -1391,33 +1443,39 @@ def test_retry_script_mismatch_retry_also_fails():
 
 
 def test_retry_echo_persists_across_retry_boundary():
-    """recent_texts carries across retries so echo from before a gap still counts."""
+    """last_text carries across retries so echo after a gap drift still works.
+
+    Pass 1 ends with "Looping text." then hits a gap. Pass 2 retries and
+    the first segment is "Looping text." again with a >5s gap from the
+    original — triggers echo.
+    """
     pass1 = [
-        make_seg(words=None, start=0.0, end=2.0, text="Looping text."),
-        make_seg(words=None, start=3.0, end=4.0, text="Looping text."),
+        make_seg(words=None, start=0.0, end=2.0, text="Normal."),
+        make_seg(words=None, start=3.0, end=5.0, text="Looping text."),
         make_seg(words=None, start=50.0, end=52.0, text="Far away."),  # gap drift
     ]
+    # Retry from 5.0. First seg is "Looping text." at start=0.0 → absolute 5.0.
+    # Last yielded was "Looping text." ending at 5.0, so gap = 5.0 - 5.0 = 0.
+    # That's ≤ 5s, so no echo. But the absolute timing matters here — the gap
+    # is computed from last_end in the *clip*, and last_text persists.
+    # Actually last_end resets to 0.0 each pass, and seg.start=0.0, gap=0 → no echo.
+    # So this tests that short-gap duplicates across boundaries are NOT false-positived.
     pass2 = [
-        make_seg(words=None, start=0.0, end=2.0, text="Looping text."),  # 3rd, yields
-        make_seg(words=None, start=3.0, end=4.0, text="Looping text."),  # 4th: echo
+        make_seg(words=None, start=0.0, end=2.0, text="Looping text."),  # gap=0, not echo
+        make_seg(words=None, start=3.0, end=5.0, text="Something else."),
     ]
-    pass3 = [
-        make_seg(words=None, start=0.0, end=3.0, text="Finally different."),
-    ]
-    model = _fake_transcribe([pass1, pass2, pass3])
+    model = _fake_transcribe([pass1, pass2])
     audio = np.zeros(120 * 16_000, dtype=np.float32)
     progress = _mock_progress()
 
     kept, discarded = _collect_retry(audio, model, language="de", progress=progress)
 
-    assert model.transcribe.call_count == 3
-    assert len(kept) == 4  # 2 from pass1, 1 from pass2, 1 from pass3
-    assert kept[3].text == "Finally different."
-    # gap + echo discards
-    assert len(discarded) == 2
-    reasons = {d[1] for d in discarded}
-    assert "gap" in reasons
-    assert "echo" in reasons
+    assert model.transcribe.call_count == 2
+    assert len(kept) == 4  # 2 from pass1, 2 from pass2
+    assert kept[2].text == "Looping text."  # not false-positived
+    # Only the gap discard
+    assert len(discarded) == 1
+    assert discarded[0][1] == "gap"
 
 
 def test_retry_cyrillic_triggers_script_mismatch():

@@ -475,8 +475,8 @@ def extract_audio(video: Path, stream_index: int = 0, *, progress: Progress) -> 
 _DRIFT_THRESHOLD: Final = 30
 """Seconds of gap between segments before assuming the decoder has drifted."""
 
-_ECHO_THRESHOLD: Final = 3
-"""Number of times a segment text must repeat in recent history to be considered an echo."""
+_ECHO_GAP_THRESHOLD: Final = 5
+"""Seconds of gap between two identical consecutive segments to be considered a decoder echo."""
 
 # Scripts that use Latin characters.  When the detected language uses one of
 # these scripts, non-Latin characters (CJK, Cyrillic, Hangul, etc.) in a
@@ -510,11 +510,13 @@ def _detect_drift(
     last_end: float,
     *,
     language: str | None,
-    recent_texts: list[str],
+    last_text: str | None,
 ) -> str | None:
     """Return a short reason string if *seg* looks like decoder drift, else None."""
+    gap = seg.start - last_end
+
     # 1. Large gap between segments
-    if seg.start - last_end > _DRIFT_THRESHOLD:
+    if gap > _DRIFT_THRESHOLD:
         return "gap"
 
     text = seg.text.strip()
@@ -523,8 +525,8 @@ def _detect_drift(
     if language in _LATIN_SCRIPT_LANGUAGES and _NON_LATIN_RE.search(text):
         return "script"
 
-    # 3. Exact text repeated too many times recently
-    if recent_texts.count(text) >= _ECHO_THRESHOLD:
+    # 3. Consecutive identical segment with a gap > 5s (decoder echo)
+    if last_text is not None and text == last_text and gap > _ECHO_GAP_THRESHOLD:
         return "echo"
 
     return None
@@ -549,7 +551,7 @@ def _transcribe_with_retry(
 
     - A gap > _DRIFT_THRESHOLD seconds between consecutive segments.
     - Non-Latin characters in a Latin-language transcription (script mismatch).
-    - The same segment text appearing _ECHO_THRESHOLD times in recent output.
+    - The same text as the previous segment with a gap > _ECHO_GAP_THRESHOLD seconds.
 
     On drift the current pass is abandoned and a fresh transcription starts from
     the last known-good position.  To avoid infinite loops, if a retry produces
@@ -558,7 +560,7 @@ def _transcribe_with_retry(
     sample_rate = 16_000
     total_duration = len(audio) / sample_rate
     offset = 0.0  # cumulative offset into the original audio
-    recent_texts: list[str] = []  # rolling window for echo detection
+    last_text: str | None = None  # text of last yielded segment (for echo detection)
 
     while offset < total_duration:
         start_sample = int(offset * sample_rate)
@@ -572,7 +574,7 @@ def _transcribe_with_retry(
 
         for seg in segments:
             reason = _detect_drift(
-                seg, last_end, language=language, recent_texts=recent_texts,
+                seg, last_end, language=language, last_text=last_text,
             )
             if reason:
                 # Yield the discarded segment so it can be logged as a comment.
@@ -595,14 +597,12 @@ def _transcribe_with_retry(
                         f"  [yellow]Drift ({reason}):[/yellow] resetting decoder at {fmt_time(drift_point)}"
                     )
                     offset = drift_point
+                last_text = None  # clear so retry's first segment isn't false-positived
                 break  # abandon this pass, retry from new offset
             yield _offset_segment(seg, offset), None
             last_end = seg.end
             yielded_any = True
-            text = seg.text.strip()
-            recent_texts.append(text)
-            if len(recent_texts) > 10:
-                recent_texts.pop(0)
+            last_text = seg.text.strip()
         else:
             # Generator exhausted normally — we're done.
             break
