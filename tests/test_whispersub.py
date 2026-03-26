@@ -9,7 +9,7 @@ import pysubs2
 import pytest
 from faster_whisper.transcribe import Segment, Word
 
-from whispersub import AssCommentPayload, _cuda_encode_works, _detect_drift, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, make_segment_comment, merge_tokens, seg_to_events, validate_audio_tracks
+from whispersub import AssCommentPayload, _cuda_encode_works, _detect_drift, _offset_segment, _surround_mix_weights, _transcribe_with_retry, collect_videos, is_hallucination, load_model, main, make_event, make_line_groups, make_segment_comment, merge_tokens, rotate_backups, seg_to_events, validate_audio_tracks
 
 
 def w(word: str, start: float = 0.0, end: float = 1.0, prob: float = 0.9) -> Word:
@@ -461,6 +461,89 @@ def test_collect_videos_empty_directory(tmp_path):
     """An empty directory returns an empty list."""
     result = collect_videos([str(tmp_path)])
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# rotate_backups
+# ---------------------------------------------------------------------------
+
+
+def test_rotate_backups_no_existing_file(tmp_path):
+    """When dest does not exist, nothing happens."""
+    dest = tmp_path / "movie.de.ass"
+    rotate_backups(dest, keep=3)
+    assert not dest.exists()
+    assert not (tmp_path / "movie.de.ass.bak").exists()
+
+
+def test_rotate_backups_first_overwrite(tmp_path):
+    """First overwrite moves current file to .bak."""
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("v1")
+    rotate_backups(dest, keep=3)
+    assert not dest.exists()
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v1"
+
+
+def test_rotate_backups_second_overwrite(tmp_path):
+    """Second overwrite shifts .bak to .bak.1 and creates new .bak."""
+    dest = tmp_path / "movie.de.ass"
+    bak = tmp_path / "movie.de.ass.bak"
+    dest.write_text("v2")
+    bak.write_text("v1")
+    rotate_backups(dest, keep=3)
+    assert not dest.exists()
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v2"
+    assert (tmp_path / "movie.de.ass.bak.1").read_text() == "v1"
+
+
+def test_rotate_backups_third_overwrite(tmp_path):
+    """Third overwrite: .bak.1→.bak.2, .bak→.bak.1, dest→.bak."""
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("v3")
+    (tmp_path / "movie.de.ass.bak").write_text("v2")
+    (tmp_path / "movie.de.ass.bak.1").write_text("v1")
+    rotate_backups(dest, keep=3)
+    assert not dest.exists()
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v3"
+    assert (tmp_path / "movie.de.ass.bak.1").read_text() == "v2"
+    assert (tmp_path / "movie.de.ass.bak.2").read_text() == "v1"
+
+
+def test_rotate_backups_excess_deleted(tmp_path):
+    """Fourth overwrite with keep=3: oldest backup is deleted."""
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("v4")
+    (tmp_path / "movie.de.ass.bak").write_text("v3")
+    (tmp_path / "movie.de.ass.bak.1").write_text("v2")
+    (tmp_path / "movie.de.ass.bak.2").write_text("v1")
+    rotate_backups(dest, keep=3)
+    assert not dest.exists()
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v4"
+    assert (tmp_path / "movie.de.ass.bak.1").read_text() == "v3"
+    assert (tmp_path / "movie.de.ass.bak.2").read_text() == "v2"
+    assert not (tmp_path / "movie.de.ass.bak.3").exists()
+
+
+def test_rotate_backups_keep_zero(tmp_path):
+    """keep=0 deletes the existing file with no backups."""
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("v1")
+    rotate_backups(dest, keep=0)
+    assert not dest.exists()
+    assert not (tmp_path / "movie.de.ass.bak").exists()
+
+
+def test_rotate_backups_keep_one(tmp_path):
+    """keep=1 keeps only .bak, deletes any numbered backups."""
+    dest = tmp_path / "movie.de.ass"
+    dest.write_text("v3")
+    (tmp_path / "movie.de.ass.bak").write_text("v2")
+    (tmp_path / "movie.de.ass.bak.1").write_text("v1")
+    rotate_backups(dest, keep=1)
+    assert not dest.exists()
+    assert (tmp_path / "movie.de.ass.bak").read_text() == "v3"
+    assert not (tmp_path / "movie.de.ass.bak.1").exists()
 
 
 # ---------------------------------------------------------------------------

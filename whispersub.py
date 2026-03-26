@@ -709,6 +709,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-track", type=int, metavar="N", help="Audio track index to transcribe (required when a file has multiple tracks)")
     parser.add_argument("--list-audio-tracks", action="store_true", help="Show audio tracks for all input videos, grouped by configuration, and exit")
     parser.add_argument("--force", action="store_true", help="Overwrite existing subtitle files (default: skip)")
+    parser.add_argument("--keep", type=int, default=3, metavar="N", help="Number of previous subtitle versions to keep when overwriting with --force")
     parser.add_argument("--output-dir", type=Path, metavar="DIR", help="Write subtitle files here instead of alongside each video")
     parser.add_argument("--colour-by", type=ColourBy, default=ColourBy.PROBABILITY, choices=list(ColourBy), help="Per-word background colour coding in console output")
     parser.add_argument("--font-size", type=int, default=48, metavar="N", help="Font size in a 1280×720 virtual canvas (scaled to actual screen resolution by the player)")
@@ -749,6 +750,48 @@ def validate_audio_tracks(videos: list[Path], requested: int | None) -> None:
         sys.exit(1)
 
 
+def rotate_backups(dest: Path, keep: int) -> None:
+    """Rotate existing subtitle file into .bak backups, keeping at most *keep*.
+
+    ``foo.de.ass`` → ``foo.de.ass.bak`` (most recent)
+    ``foo.de.ass.bak`` → ``foo.de.ass.bak.1``
+    ``foo.de.ass.bak.1`` → ``foo.de.ass.bak.2``
+    Backups beyond *keep* are deleted.
+    """
+    if not dest.exists() or keep <= 0:
+        if dest.exists() and keep <= 0:
+            dest.unlink()
+        return
+    bak = Path(str(dest) + ".bak")
+
+    def numbered(n: int) -> Path:
+        return Path(f"{bak}.{n}")
+
+    # Delete excess numbered backups (.bak counts as slot 1, .bak.1 as slot 2, etc.)
+    for n in range(max(keep - 1, 1), keep + 100):
+        p = numbered(n)
+        if p.exists():
+            p.unlink()
+        else:
+            break
+
+    # Shift numbered backups up by one
+    for n in range(keep - 2, 0, -1):
+        src = numbered(n)
+        if src.exists():
+            src.rename(numbered(n + 1))
+
+    # .bak → .bak.1
+    if bak.exists():
+        if keep > 1:
+            bak.rename(numbered(1))
+        else:
+            bak.unlink()
+
+    # dest → .bak
+    dest.rename(bak)
+
+
 def process_video(
     progress: Progress,
     video: Path,
@@ -770,6 +813,8 @@ def process_video(
     if not args.force and dest.exists():
         progress.console.print("  [yellow]Skipping:[/yellow] subtitle already exists.")
     else:
+        if args.force and dest.exists():
+            rotate_backups(dest, args.keep)
         subs = build_subs(
             segments,
             font_size=args.font_size,
