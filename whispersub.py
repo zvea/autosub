@@ -27,7 +27,6 @@ import numpy as np
 import pysubs2
 from faster_whisper import WhisperModel
 from faster_whisper.transcribe import Segment, TranscriptionInfo, Word
-from faster_whisper.vad import VadOptions
 from rich.console import Console
 from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
@@ -66,8 +65,8 @@ class TranscribeParams:
     language: str | None = None
     multilingual: bool = True
     word_timestamps: bool = True
-    vad_filter: bool = True  # Voice Activity Detection
-    vad_parameters: VadOptions = dataclasses.field(default_factory=lambda: VadOptions(threshold=0.3))
+    vad_filter: bool = False
+    hallucination_silence_threshold: float | None = 2
 
 
 _TRANSCRIBE_PARAMS: Final = TranscribeParams()
@@ -330,7 +329,7 @@ def seg_to_events(
     max_line_count: int,
 ) -> Iterator[pysubs2.SSAEvent]:
     """Yield one SSAEvent per subtitle card, splitting long segments across multiple cards."""
-    # nsp is post-VAD, so it tends to be low for all segments and is rarely informative.
+    # nsp tends to be low for all segments and is rarely informative.
     name = f"seg:{seg_id} logp:{seg.avg_logprob:.2f} nsp:{seg.no_speech_prob:.2f} cr:{seg.compression_ratio:.2f} t:{seg.temperature:.1f}"
     if not seg.words:
         yield pysubs2.SSAEvent(
@@ -471,8 +470,7 @@ def set_script_info(subs: pysubs2.SSAFile, info: TranscriptionInfo, video: Path)
     subs.info["X-Transcribed-At"] = datetime.now().isoformat(timespec="seconds")
     subs.info["X-Language"] = f"{info.language} ({info.language_probability:.1%})"
     subs.info["X-Languages"] = lang_summary
-    # Duration after VAD (voice activity detection) vs total - large gap indicates heavy noise or silence.
-    subs.info["X-Duration"] = f"{fmt_time(info.duration)} (speech: {fmt_time(info.duration_after_vad)})"
+    subs.info["X-Duration"] = f"{fmt_time(info.duration)}"
     subs.info["X-Model"] = _MODEL
     subs.info["X-Transcribe-Params"] = repr(_TRANSCRIBE_PARAMS)
 
